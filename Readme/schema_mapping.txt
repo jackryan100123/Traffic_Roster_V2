@@ -1,0 +1,86 @@
+OLD DATABASE TO NEW DATABASE MAPPING
+
+1. Zone Mapping:
+   OLD TABLE: roster_app_zone
+   - id → id
+   - name → name
+   - vehicle_no → (Not in new model)
+   - inspector_id → (Not in new model)
+   NEW MODEL: Zone(models.Model)
+   - id
+   - name
+   - description (New field, will be set to NULL)
+
+2. Area Mapping:
+   OLD TABLE: roster_app_area
+   - id → id  
+   - name → name
+   - vehicle_no → vehicle_no
+   - zone_id → zone_id (ForeignKey to Zone)
+   - call_sign → call_sign
+   NEW MODEL: Area(models.Model)
+   - id
+   - zone (ForeignKey)
+   - name
+   - call_sign
+   - vehicle_no
+
+3. Policeman Mapping:
+   OLD TABLE: roster_app_policeman
+   - id → id
+   - name → name
+   - rank → (Need to convert to RANK_CHOICES in new model)
+   - rank_type → (Not used in new model)
+   - gender → (available in model)
+   - preferred_duty → (Need to convert to DUTY_CHOICES in new model)
+   - specialized_job → specialized_duty
+   - driver → is_driver
+   - beltno → belt_no
+   NEW MODEL: Policeman(models.Model)
+   - id
+   - name
+   - belt_no
+   - rank (CHOICES: 'INSP', 'SI', 'ASI', 'HC', 'CONST', 'HG')
+   - is_driver
+   - preferred_duty (CHOICES: 'STATIC', 'FIELD')
+   - specialized_duty
+   - has_fixed_duty (Will be set to False for all imported records)
+   - fixed_area (Will be set to NULL for all imported records)
+
+4. Deployment Mapping:
+   OLD TABLE: roster_app_deployment
+   - id → id
+   - si_count → si_count
+   - asi_count → asi_count
+   - hc_count → hc_count
+   - constable_count → constable_count
+   - hgv_count → hgv_count
+   - driver_count → driver_count
+   - senior_count → senior_count
+   - area_id → area_id
+   - created_at → created_at
+   NEW MODEL: Deployment(models.Model)
+   - id
+   - area (ForeignKey)
+   - si_count
+   - asi_count 
+   - hc_count
+   - constable_count
+   - hgv_count
+   - driver_count
+   - senior_count
+   - created_at
+   - updated_at (Will be set to created_at during import)
+
+Rank Mapping:
+- "Inspector" → 'INSP'
+- "Sub Inspector" → 'SI'
+- "Assistant Sub Inspector" → 'ASI'
+- "Head Constable" → 'HC'
+- "Constable" → 'CONST'
+- "Home Guard" → 'HG'
+
+Duty Type Mapping:
+- "Static" → 'STATIC'
+- "Field" → 'FIELD'
+- (Any other value) → 'FIELD' 
