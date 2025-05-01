@@ -32,6 +32,21 @@ interface RosterAssignment {
   call_sign: string;
 }
 
+// Update FixedDutyPoliceman interface to include specialized duty
+interface FixedDutyPoliceman {
+  id: number;
+  name: string;
+  belt_no: string;
+  rank: string;
+  area_name: string;
+  area_id: number;
+  zone_name: string;
+  zone_id: number;
+  call_sign: string;
+  specialized_duty?: string;
+  fixed_area?: string;
+}
+
 interface ReservedOfficer {
   id: number;
   name: string;
@@ -129,12 +144,26 @@ interface Assignment {
   belt_no?: string;
   rank?: string;
   call_sign?: string;
+  is_fixed_duty?: boolean;
+  fixed_area?: string;
+  fixed_zone?: string;
 }
 
 interface GroupedAssignments {
   [zoneName: string]: {
     [areaName: string]: Assignment[];
   };
+}
+
+interface Area {
+  id: number;
+  name: string;
+  zone: number;
+}
+
+interface Zone {
+  id: number;
+  name: string;
 }
 
 const RosterGenerator: React.FC = () => {
@@ -154,6 +183,24 @@ const RosterGenerator: React.FC = () => {
   const [editingRosterId, setEditingRosterId] = useState<number | null>(null);
   const [isCorrigendumModalOpen, setIsCorrigendumModalOpen] = useState(false);
   const [expandedRosters, setExpandedRosters] = useState<Record<number, boolean>>({});
+  const [fixedDutyPolicemen, setFixedDutyPolicemen] = useState<FixedDutyPoliceman[]>([]);
+  const [areas, setAreas] = useState<Area[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
+
+  // Add helper functions for getting area and zone names
+  const getAreaName = (areaId: number | null): string => {
+    if (!areaId) return 'Not Assigned';
+    const area = areas.find((a) => a.id === areaId);
+    return area ? area.name : 'Unknown Area';
+  };
+
+  const getZoneName = (areaId: number | null): string => {
+    if (!areaId) return '';
+    const area = areas.find((a) => a.id === areaId);
+    if (!area) return '';
+    const zone = zones.find((z) => z.id === area.zone);
+    return zone ? zone.name : '';
+  };
 
   // Fetch active and previous rosters
   const fetchRosters = async () => {
@@ -435,21 +482,28 @@ const RosterGenerator: React.FC = () => {
       
       // Create worksheet with all assignments
       const allAssignmentsData = [
-        ['Zone', 'Area', 'Name', 'Belt No.', 'Rank', 'Call Sign']
+        ['Zone', 'Area', 'Name', 'Belt No.', 'Rank', 'Status', 'Fixed Area']
       ];
       
       // Add all assignments with zone and area grouping
       Object.keys(groupedAssignments).forEach(zoneName => {
         Object.keys(groupedAssignments[zoneName]).forEach(areaName => {
           groupedAssignments[zoneName][areaName].forEach(assignment => {
-            allAssignmentsData.push([
-              zoneName,
-              areaName,
+            const row = [
+              // If it's a fixed duty officer, use their fixed zone, otherwise use current assignment zone
+              (assignment.is_fixed_duty ? assignment.fixed_zone : zoneName) || '',
+              // If it's a fixed duty officer, use their fixed area, otherwise use current assignment area
+              (assignment.is_fixed_duty ? assignment.fixed_area : areaName) || '',
               assignment.policeman_name || '',
               assignment.belt_no || '',
               assignment.rank || '',
-              assignment.call_sign || ''
-            ]);
+              assignment.is_fixed_duty ? 'Fixed Duty' : 'Regular',
+              // Include call sign with fixed area for fixed duty officers
+              assignment.is_fixed_duty ? 
+                `${assignment.fixed_area || ''}${assignment.call_sign ? ` (${assignment.call_sign})` : ''}` : 
+                '-'
+            ];
+            allAssignmentsData.push(row);
           });
         });
       });
@@ -460,26 +514,31 @@ const RosterGenerator: React.FC = () => {
       // Create separate worksheets for each zone
       Object.keys(groupedAssignments).forEach(zoneName => {
         const zoneData = [
-          ['Area', 'Name', 'Belt No.', 'Rank', 'Call Sign']
+          ['Area', 'Name', 'Belt No.', 'Rank', 'Status', 'Fixed Area']
         ];
         
         Object.keys(groupedAssignments[zoneName]).forEach(areaName => {
           // Add area header row
-          zoneData.push([areaName, '', '', '', '']);
+          zoneData.push([areaName, '', '', '', '', '']);
           
           // Add assignments for this area
           groupedAssignments[zoneName][areaName].forEach(assignment => {
             zoneData.push([
-              '',
+              // If it's a fixed duty officer, use their fixed area
+              (assignment.is_fixed_duty ? assignment.fixed_area : '') || '',
               assignment.policeman_name || '',
               assignment.belt_no || '',
               assignment.rank || '',
-              assignment.call_sign || ''
+              assignment.is_fixed_duty ? 'Fixed Duty' : 'Regular',
+              // Include call sign with fixed area for fixed duty officers
+              assignment.is_fixed_duty ? 
+                `${assignment.fixed_area || ''}${assignment.call_sign ? ` (${assignment.call_sign})` : ''}` : 
+                '-'
             ]);
           });
           
           // Add empty row after each area
-          zoneData.push(['', '', '', '', '']);
+          zoneData.push(['', '', '', '', '', '']);
         });
         
         const zoneWorksheet = XLSX.utils.aoa_to_sheet(zoneData);
@@ -992,19 +1051,55 @@ Total unfulfilled requirements: ${Object.entries(totalShortcomings).map(([rank, 
   };
 
   const groupAssignmentsByZoneAndArea = (assignments: Assignment[]): GroupedAssignments => {
-    return assignments.reduce((acc: GroupedAssignments, assignment) => {
+    const grouped: GroupedAssignments = {};
+    
+    // First add fixed duty policemen
+    fixedDutyPolicemen.forEach(policeman => {
+      const { zone_name, area_name } = policeman;
+      
+      if (!grouped[zone_name]) {
+        grouped[zone_name] = {};
+      }
+      if (!grouped[zone_name][area_name]) {
+        grouped[zone_name][area_name] = [];
+      }
+
+      // Get the area name and zone name for the fixed duty area
+      const fixedAreaName = getAreaName(policeman.fixed_area ? Number(policeman.fixed_area) : null);
+      const fixedZoneName = getZoneName(policeman.fixed_area ? Number(policeman.fixed_area) : null);
+      
+      grouped[zone_name][area_name].push({
+        id: policeman.id,
+        policeman_name: policeman.name,
+        policeman_id: policeman.id,
+        belt_no: policeman.belt_no,
+        rank: policeman.rank,
+        area_name: policeman.area_name,
+        area_id: policeman.area_id,
+        zone_name: policeman.zone_name,
+        zone_id: policeman.zone_id,
+        call_sign: policeman.call_sign,
+        is_fixed_duty: true,
+        fixed_area: fixedAreaName,
+        fixed_zone: fixedZoneName
+      });
+    });
+    
+    // Then add regular assignments
+    assignments.forEach(assignment => {
       const { zone_name, area_name } = assignment;
       
-      if (!acc[zone_name]) {
-        acc[zone_name] = {};
+      if (!grouped[zone_name]) {
+        grouped[zone_name] = {};
       }
-      if (!acc[zone_name][area_name]) {
-        acc[zone_name][area_name] = [];
+      if (!grouped[zone_name][area_name]) {
+        grouped[zone_name][area_name] = [];
       }
       
-      acc[zone_name][area_name].push(assignment);
-      return acc;
-    }, {});
+      grouped[zone_name][area_name].push(assignment);
+    });
+    
+    return grouped;
   };
 
   // Component to display reserved officers
@@ -1105,7 +1200,7 @@ Total unfulfilled requirements: ${Object.entries(totalShortcomings).map(([rank, 
     );
   };
 
-  // Update the renderPendingRoster function to include reserved officers
+  // Update the renderPendingRoster function
   const renderPendingRoster = () => {
     if (!pendingRoster) return null;
     
@@ -1114,7 +1209,7 @@ Total unfulfilled requirements: ${Object.entries(totalShortcomings).map(([rank, 
     return (
       <div className="bg-white rounded-lg shadow p-4 mb-6">
         <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-medium text-gray-900">Pending Roster</h3>
+          <h3 className="text-lg font-medium text-gray-900">Fixed Duties</h3>
           <div className="flex space-x-2">
             <button
               onClick={() => setShowConfirmSave(true)}
@@ -1165,16 +1260,38 @@ Total unfulfilled requirements: ${Object.entries(totalShortcomings).map(([rank, 
                           <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
                           <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Belt No.</th>
                           <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Rank</th>
-                          <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Call Sign</th>
+                          <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                          <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Fixed Area</th>
+                          <th scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Zone</th>
                         </tr>
                       </thead>
                       <tbody className="bg-white divide-y divide-gray-200">
                         {groupedAssignments[zoneName][areaName].map((assignment, index) => (
-                          <tr key={index}>
-                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{assignment.policeman_name}</td>
+                          <tr key={index} className={assignment.is_fixed_duty ? 'bg-blue-50' : ''}>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {assignment.policeman_name}
+                              {assignment.is_fixed_duty && (
+                                <span className="ml-2 text-xs text-blue-600">(Fixed Duty)</span>
+                              )}
+                            </td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{assignment.belt_no}</td>
                             <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{assignment.rank}</td>
-                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{assignment.call_sign}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {assignment.is_fixed_duty ? 'Fixed Duty' : 'Regular'}
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {assignment.is_fixed_duty ? (
+                                <>
+                                  {assignment.fixed_area}
+                                  {assignment.call_sign && (
+                                    <span className="ml-2 text-xs text-gray-500">({assignment.call_sign})</span>
+                                  )}
+                                </>
+                              ) : '-'}
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {assignment.is_fixed_duty ? assignment.fixed_zone : '-'}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -1468,6 +1585,30 @@ Total unfulfilled requirements: ${Object.entries(totalShortcomings).map(([rank, 
       </div>
     );
   };
+
+  // Modify the fetchFixedDutyPolicemen function to also fetch areas and zones
+  const fetchFixedDutyPolicemen = async () => {
+    try {
+      // Fetch areas and zones first
+      const [areasResponse, zonesResponse, fixedPoliceResponse] = await Promise.all([
+        axios.get('http://127.0.0.1:8000/api/areas/'),
+        axios.get('http://127.0.0.1:8000/api/zones/'),
+        axios.get('http://127.0.0.1:8000/api/policemen/?has_fixed_duty=true')
+      ]);
+
+      setAreas(areasResponse.data);
+      setZones(zonesResponse.data);
+      setFixedDutyPolicemen(fixedPoliceResponse.data);
+    } catch (err) {
+      console.error('Error fetching fixed duty policemen:', err);
+      toast.error(`Failed to load fixed duty policemen: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  };
+
+  // Call fetchFixedDutyPolicemen when component mounts
+  useEffect(() => {
+    fetchFixedDutyPolicemen();
+  }, []);
 
   return (
     <div className="container mx-auto px-4 py-8">
