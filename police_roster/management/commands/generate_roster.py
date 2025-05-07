@@ -28,6 +28,14 @@ class RosterGenerator:
         'Rhino-01', 'Rhino-02'
     }
     
+   
+    FORCED_ASSIGNMENTS = {
+        # Add your forced assignments here
+        "6320": 602,
+        "3148": 602
+        
+    }
+    
     def __init__(self, verbose=False):
         self.repetition_count = 0
         self.same_area_repetition_count = 0
@@ -37,6 +45,12 @@ class RosterGenerator:
         self.reserved_officers = []  # Track officers not assigned in current roster (reserved)
         self.verbose = verbose
         self.zone_shortages = defaultdict(int)  # Track shortages by zone to distribute them evenly
+        # Initialize forced assignments from class variable
+        self.forced_assignments = self.FORCED_ASSIGNMENTS
+        if self.verbose and self.forced_assignments:
+            print(f"DEBUG: Loaded {len(self.forced_assignments)} forced assignments")
+            for belt_no, area_id in self.forced_assignments.items():
+                print(f"  - Belt #{belt_no} -> Area ID {area_id}")
     
     def load_previous_assignments(self):
         """Load most recent previous assignments and corrigendum changes"""
@@ -653,10 +667,78 @@ class RosterGenerator:
         # Check if area has restricted call sign for female employees
         is_restricted = self._is_restricted_area(area)
         
+        # Debug output
+        if self.verbose or count > 0:
+            print(f"DEBUG: Allocating {count} senior officers to area {area.name}")
+            
+        # Check for forced assignments for this area
+        if self.forced_assignments:
+            # Find officers with belt numbers that should be forced to this area
+            forced_belt_numbers = [belt_no for belt_no, area_id in self.forced_assignments.items() 
+                                 if area_id == area.id]
+            
+            if forced_belt_numbers:
+                if self.verbose:
+                    print(f"DEBUG: Found {len(forced_belt_numbers)} forced assignments for area {area.name}")
+                    print(f"DEBUG: Forced belt numbers: {forced_belt_numbers}")
+                
+                # Find officers with matching belt numbers for senior positions
+                forced_officers = []
+                for belt_no in forced_belt_numbers:
+                    # Search for officers with matching belt number
+                    matching_officers = Policeman.objects.filter(
+                        belt_no=belt_no,
+                        preferred_duty='FIELD',
+                        has_fixed_duty=False,
+                        rank__in=['SI', 'ASI', 'HC']  # Only look for senior ranks
+                    ).exclude(
+                        id__in=list(self.assigned_officers)
+                    )
+                    
+                    if matching_officers.exists():
+                        officer = matching_officers.first()
+                        if self.verbose:
+                            print(f"DEBUG: Found forced senior officer {officer.name} (Belt #{officer.belt_no}, Rank: {officer.rank})")
+                        forced_officers.append(officer)
+                    else:
+                        if self.verbose:
+                            print(f"WARNING: Could not find senior officer with belt number {belt_no}")
+                
+                # Process forced assignments
+                for officer in forced_officers:
+                    # Skip if restricted area and female officer
+                    if is_restricted and self._is_female_officer(officer):
+                        if self.verbose:
+                            print(f"WARNING: Cannot force assign female officer {officer.name} to restricted area {area.name}")
+                        continue
+                    
+                    was_previous_zone, was_previous_area = self._check_previous_assignment(officer, area)
+                    
+                    assignments.append({
+                        'officer': officer,
+                        'was_previous_zone': was_previous_zone,
+                        'was_previous_area': was_previous_area
+                    })
+                    
+                    # Update tracking
+                    self.assigned_officers.add(officer.id)
+                    if was_previous_zone:
+                        self.repetition_count += 1
+                    if was_previous_area:
+                        self.same_area_repetition_count += 1
+                    
+                    if self.verbose:
+                        print(f"DEBUG: Force assigned senior officer {officer.name} (Belt #{officer.belt_no}, Rank: {officer.rank}) to area {area.name}")
+                
+                # Adjust count for remaining officers needed
+                count -= len(assignments)
+                if count <= 0:
+                    return assignments
+
         # Filter out officers already assigned to this roster
         available_officers = [o for o in senior_officers_pool if o.id not in self.assigned_officers]
         
-        # Count available officers before gender filtering
+        # Count before gender filtering
         count_before = len(available_officers)
         
         # Filter out female officers if this is a restricted area
@@ -1107,28 +1189,82 @@ class RosterGenerator:
         if self.verbose or count > 0:
             print(f"DEBUG: Allocating {count} officers of rank {rank} to area {area.name} (restricted: {is_restricted})")
             print(f"DEBUG: Initial pool size for rank {rank}: {len(officers_pool)}")
-        
-        # Special handling for Home Guards - if we don't have enough in the pool
-        if rank == 'HG' and len(officers_pool) < count and self.verbose:
-            # Try to get more Home Guards directly from database
-            more_home_guards_query = Policeman.objects.filter(
-                rank='HG',
-                preferred_duty='FIELD',
-                has_fixed_duty=False
-            ).exclude(
-                id__in=list(self.assigned_officers)
-            )
             
-            # Filter out female officers for restricted areas
-            if is_restricted:
-                print(f"RESTRICTED AREA DB QUERY: Filtering out female Home Guards for {area.name}")
-                more_home_guards_query = more_home_guards_query.exclude(gender='F')
+        # Check for forced assignments for this area
+        if self.forced_assignments:
+            # Find officers with belt numbers that should be forced to this area
+            forced_belt_numbers = [belt_no for belt_no, area_id in self.forced_assignments.items() 
+                                 if area_id == area.id]
+            
+            if forced_belt_numbers:
+                if self.verbose:
+                    print(f"DEBUG: Found {len(forced_belt_numbers)} forced assignments for area {area.name}")
+                    print(f"DEBUG: Forced belt numbers: {forced_belt_numbers}")
                 
-            more_home_guards = list(more_home_guards_query)
-            if more_home_guards:
-                officers_pool = list(officers_pool) + more_home_guards
-                print(f"DEBUG: Added {len(more_home_guards)} more Home Guards, new pool size: {len(officers_pool)}")
-        
+                # Find officers with matching belt numbers for this specific rank
+                forced_officers = []
+                for belt_no in forced_belt_numbers:
+                    # Search for officers with matching belt number
+                    matching_officers = Policeman.objects.filter(
+                        belt_no=belt_no,
+                        preferred_duty='FIELD',
+                        has_fixed_duty=False
+                    ).exclude(
+                        id__in=list(self.assigned_officers)
+                    )
+                    
+                    # Special handling for senior ranks
+                    if rank == 'SENIOR':
+                        # For senior positions, accept SI, ASI, or HC
+                        matching_officers = matching_officers.filter(rank__in=['SI', 'ASI', 'HC'])
+                        if self.verbose:
+                            print(f"DEBUG: Looking for senior officer with belt #{belt_no}")
+                    else:
+                        # For other positions, match exact rank
+                        matching_officers = matching_officers.filter(rank=rank)
+                        if self.verbose:
+                            print(f"DEBUG: Looking for {rank} officer with belt #{belt_no}")
+                    
+                    if matching_officers.exists():
+                        officer = matching_officers.first()
+                        if self.verbose:
+                            print(f"DEBUG: Found forced officer {officer.name} (Belt #{officer.belt_no}, Rank: {officer.rank}) for rank {rank}")
+                        forced_officers.append(officer)
+                    else:
+                        if self.verbose:
+                            print(f"WARNING: Could not find officer with belt number {belt_no} for rank {rank}")
+                
+                # Process forced assignments
+                for officer in forced_officers:
+                    # Skip if restricted area and female officer
+                    if is_restricted and self._is_female_officer(officer):
+                        if self.verbose:
+                            print(f"WARNING: Cannot force assign female officer {officer.name} to restricted area {area.name}")
+                        continue
+                    
+                    was_previous_zone, was_previous_area = self._check_previous_assignment(officer, area)
+                    
+                    assignments.append({
+                        'officer': officer,
+                        'was_previous_zone': was_previous_zone,
+                        'was_previous_area': was_previous_area
+                    })
+                    
+                    # Update tracking
+                    self.assigned_officers.add(officer.id)
+                    if was_previous_zone:
+                        self.repetition_count += 1
+                    if was_previous_area:
+                        self.same_area_repetition_count += 1
+                    
+                    if self.verbose:
+                        print(f"DEBUG: Force assigned officer {officer.name} (Belt #{officer.belt_no}, Rank: {officer.rank}) to area {area.name}")
+                
+                # Adjust count for remaining officers needed
+                count -= len(assignments)
+                if count <= 0:
+                    return assignments
+
         # Filter out officers already assigned to this roster
         available_officers = [o for o in officers_pool if o.id not in self.assigned_officers]
         
