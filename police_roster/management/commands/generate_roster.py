@@ -667,6 +667,10 @@ class RosterGenerator:
         # Check if area has restricted call sign for female employees
         is_restricted = self._is_restricted_area(area)
         
+        # Define critical rank for senior officers
+        is_critical_rank = True  # Senior positions are always critical
+        rank = 'SENIOR'  # Define rank for senior positions
+        
         # Debug output
         if self.verbose or count > 0:
             print(f"DEBUG: Allocating {count} senior officers to area {area.name}")
@@ -685,7 +689,7 @@ class RosterGenerator:
                 # Find officers with matching belt numbers for senior positions
                 forced_officers = []
                 for belt_no in forced_belt_numbers:
-                    # Search for officers with matching belt number
+                    # Search for officers with matching belt number and senior rank
                     matching_officers = Policeman.objects.filter(
                         belt_no=belt_no,
                         preferred_duty='FIELD',
@@ -773,18 +777,39 @@ class RosterGenerator:
             else:
                 no_repetition.append((officer, was_previous_zone, was_previous_area))
         
+        # For critical ranks (SI, HG, drivers), ensure we allocate even if it means repetition
+        if is_critical_rank and count > 0:
+            if self.verbose:
+                print(f"DEBUG: Special allocation for critical rank {rank}")
+                print(f"DEBUG: No repetition: {len(no_repetition)}, Zone repetition: {len(zone_repetition)}, Area repetition: {len(area_repetition)}")
+        
         # Combine all categories in priority order
         prioritized_officers = no_repetition + zone_repetition + area_repetition
         
         # Assign officers according to priority and count needed
         to_assign = min(count, len(prioritized_officers))
         
+        # If we're still short on officers for critical ranks but have some available, relax the repetition constraints
+        if is_critical_rank and to_assign < count and available_officers:
+            if self.verbose:
+                print(f"PRIORITY OVERRIDE: Critical rank {rank} shortage. Will attempt to assign with repetition.")
+            # Use all available officers, even if it means repetition
+            to_assign = min(count, len(available_officers))
+        
+        if self.verbose or count > 0:
+            print(f"DEBUG: Attempting to assign {to_assign} of {count} requested {rank} officers to {area.name}")
+        
         for i in range(to_assign):
-            officer, was_previous_zone, was_previous_area = prioritized_officers[i]
+            if i < len(prioritized_officers):
+                officer, was_previous_zone, was_previous_area = prioritized_officers[i]
+            else:
+                # If we've exhausted prioritized officers but need more for critical ranks
+                officer = available_officers[i]
+                was_previous_zone, was_previous_area = self._check_previous_assignment(officer, area)
             
             # Double-check we're not assigning a female to restricted area
             if is_restricted and self._is_female_officer(officer):
-                print(f"ERROR PREVENTION: Attempted to assign female senior officer {officer.name} to restricted area {area.name}. Skipping.")
+                print(f"ERROR PREVENTION: Attempted to assign female officer {officer.name} (rank: {rank}) to restricted area {area.name}. Skipping.")
                 continue
                 
             assignments.append({
@@ -799,10 +824,10 @@ class RosterGenerator:
                 self.repetition_count += 1
             if was_previous_area:
                 self.same_area_repetition_count += 1
-            
-            # Also remove from original senior_officers_pool to avoid reassignment
-            if officer in senior_officers_pool:
-                senior_officers_pool.remove(officer)
+        
+        # Final check if we managed to fill all requirements
+        if len(assignments) < count and self.verbose:
+            print(f"WARNING: Could not fulfill all requirements for rank {rank} in area {area.name}. Needed {count}, assigned {len(assignments)}")
         
         return assignments
     
@@ -851,7 +876,94 @@ class RosterGenerator:
         if is_restricted:
             print(f"RESTRICTED AREA CHECK: {area.name} with call_sign '{area.call_sign}' - NO female officers allowed")
         
-        # FIRST: Allocate drivers - prioritize driver allocation before anything else
+        # FIRST: Handle forced assignments for this area
+        if self.forced_assignments:
+            forced_belt_numbers = [belt_no for belt_no, area_id in self.forced_assignments.items() 
+                                 if area_id == area.id]
+            
+            if forced_belt_numbers:
+                if self.verbose:
+                    print(f"DEBUG: Processing forced assignments for area {area.name}")
+                    print(f"DEBUG: Forced belt numbers: {forced_belt_numbers}")
+                
+                # Process each forced assignment
+                for belt_no in forced_belt_numbers:
+                    # Find the officer with this belt number
+                    forced_officer = Policeman.objects.filter(
+                        belt_no=belt_no,
+                        preferred_duty='FIELD',
+                        has_fixed_duty=False
+                    ).first()  # Remove the exclude to ensure we find the forced officer even if already assigned
+                    
+                    if forced_officer:
+                        # Skip if restricted area and female officer
+                        if is_restricted and self._is_female_officer(forced_officer):
+                            if self.verbose:
+                                print(f"WARNING: Cannot force assign female officer {forced_officer.name} to restricted area {area.name}")
+                            continue
+                        
+                        # If the officer is already assigned somewhere else, remove that assignment
+                        if forced_officer.id in self.assigned_officers:
+                            if self.verbose:
+                                print(f"DEBUG: Removing previous assignment for forced officer {forced_officer.name}")
+                            # Remove from assigned officers set
+                            self.assigned_officers.remove(forced_officer.id)
+                            # Remove any existing assignments for this officer in this roster
+                            RosterAssignment.objects.filter(
+                                roster=roster,
+                                policeman=forced_officer
+                            ).delete()
+                            # Remove from any existing assignments in our list
+                            area_assignments = [a for a in area_assignments if a['officer'].id != forced_officer.id]
+                        
+                        was_previous_zone, was_previous_area = self._check_previous_assignment(forced_officer, area)
+                        
+                        # Create the assignment
+                        assignment = {
+                            'officer': forced_officer,
+                            'was_previous_zone': was_previous_zone,
+                            'was_previous_area': was_previous_area
+                        }
+                        
+                        # Add to assignments
+                        area_assignments.append(assignment)
+                        
+                        # Update tracking
+                        self.assigned_officers.add(forced_officer.id)
+                        if was_previous_zone:
+                            self.repetition_count += 1
+                        if was_previous_area:
+                            self.same_area_repetition_count += 1
+                        
+                        if self.verbose:
+                            print(f"DEBUG: Force assigned officer {forced_officer.name} (Belt #{forced_officer.belt_no}, Rank: {forced_officer.rank}) to area {area.name}")
+                        
+                        # Adjust deployment requirements based on the forced assignment
+                        if forced_officer.rank == 'SI':
+                            deployment.si_count = max(0, deployment.si_count - 1)
+                        elif forced_officer.rank == 'ASI':
+                            deployment.asi_count = max(0, deployment.asi_count - 1)
+                        elif forced_officer.rank == 'HC':
+                            deployment.hc_count = max(0, deployment.hc_count - 1)
+                        elif forced_officer.rank == 'CONST':
+                            deployment.constable_count = max(0, deployment.constable_count - 1)
+                        elif forced_officer.rank == 'HG':
+                            deployment.hgv_count = max(0, deployment.hgv_count - 1)
+                        elif forced_officer.is_driver:
+                            deployment.driver_count = max(0, deployment.driver_count - 1)
+                        
+                        # Adjust senior count if applicable
+                        if forced_officer.rank in ['SI', 'ASI', 'HC']:
+                            deployment.senior_count = max(0, deployment.senior_count - 1)
+                        
+                        # Remove the forced officer from their rank pool to prevent double assignment
+                        if forced_officer.rank in officers_by_rank:
+                            officers_by_rank[forced_officer.rank] = [
+                                o for o in officers_by_rank[forced_officer.rank] 
+                                if o.id != forced_officer.id
+                            ]
+        
+        # SECOND: Allocate drivers - prioritize driver allocation before anything else
         driver_assignments = self._allocate_drivers(drivers, deployment.driver_count, area)
         
         # Verify no female drivers were assigned to restricted areas
@@ -880,18 +992,21 @@ class RosterGenerator:
         }
         
         for rank, count in ranks_to_allocate.items():
-            assignments = self._allocate_officers(rank, officers_by_rank.get(rank, []), count, area)
-            
-            # Verify no female officers were assigned to restricted areas
-            if is_restricted:
-                assignments = [a for a in assignments if not self._is_female_officer(a['officer'])]
-            
-            area_assignments.extend(assignments)
-            
-            if len(assignments) < count:
-                unfulfilled_requirements[rank] = count - len(assignments)
-                # Track shortage by zone for balanced distribution
-                self.zone_shortages[area.zone_id] += (count - len(assignments))
+            if count > 0:  # Only allocate if there's a requirement
+                # Filter out any officers that are already assigned
+                available_officers = [o for o in officers_by_rank.get(rank, []) if o.id not in self.assigned_officers]
+                assignments = self._allocate_officers(rank, available_officers, count, area)
+                
+                # Verify no female officers were assigned to restricted areas
+                if is_restricted:
+                    assignments = [a for a in assignments if not self._is_female_officer(a['officer'])]
+                
+                area_assignments.extend(assignments)
+                
+                if len(assignments) < count:
+                    unfulfilled_requirements[rank] = count - len(assignments)
+                    # Track shortage by zone for balanced distribution
+                    self.zone_shortages[area.zone_id] += (count - len(assignments))
         
         # Track areas with unfulfilled requirements
         if unfulfilled_requirements:
@@ -916,6 +1031,12 @@ class RosterGenerator:
             if is_restricted and self._is_female_officer(assignment['officer']):
                 print(f"SECURITY CHECK: Prevented female officer {assignment['officer'].name} from being assigned to restricted area {area.name}")
                 continue
+            
+            # Remove any existing assignment for this officer in this roster
+            RosterAssignment.objects.filter(
+                roster=roster,
+                policeman=assignment['officer']
+            ).delete()
                 
             roster_assignment = RosterAssignment.objects.create(
                 roster=roster,
