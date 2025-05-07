@@ -182,11 +182,97 @@ class RosterGenerator:
         if self.verbose:
             print(f"DEBUG: Found {len(drivers)} field-duty drivers available for assignment")
 
-        # Create a senior officers pool (SI, ASI, HC)
+        # Track assignment counts
+        rank_assignments = {
+            'SI': 0,
+            'ASI': 0,
+            'HC': 0,
+            'CONST': 0,
+            'HG': 0,
+            'DRIVER': 0,
+            'SENIOR': 0
+        }
+
+        # FIRST: Handle SI assignments separately
+        si_assignments = []
+        if 'SI' in officers_by_rank:
+            available_sis = officers_by_rank['SI']
+            if self.verbose:
+                print(f"\nDEBUG: Starting SI assignments with {len(available_sis)} available SIs")
+            
+            # Get areas needing SIs
+            areas_needing_sis = [(area, deployment) for area, deployment in areas_with_deployments if deployment.si_count > 0]
+            
+            # Sort by SI requirement count (highest first)
+            areas_needing_sis.sort(key=lambda x: x[1].si_count, reverse=True)
+            
+            if self.verbose:
+                print(f"DEBUG: Found {len(areas_needing_sis)} areas needing SIs")
+            
+            # Process SI assignments
+            for area, deployment in areas_needing_sis:
+                if deployment.si_count > 0 and available_sis:
+                    # Get available SIs for this area (considering restrictions)
+                    available_sis_for_area = available_sis
+                    if self._is_restricted_area(area):
+                        available_sis_for_area = [si for si in available_sis if not self._is_female_officer(si)]
+                    
+                    if available_sis_for_area:
+                        si_assignments_for_area = self._allocate_officers('SI', available_sis_for_area, deployment.si_count, area)
+                        si_assignments.extend([(area, assignment) for assignment in si_assignments_for_area])
+                        
+                        # Update available SIs and track assignments
+                        assigned_si_ids = {assignment['officer'].id for assignment in si_assignments_for_area}
+                        available_sis = [si for si in available_sis if si.id not in assigned_si_ids]
+                        rank_assignments['SI'] += len(si_assignments_for_area)
+                        
+                        if self.verbose:
+                            print(f"DEBUG: Assigned {len(si_assignments_for_area)} SIs to {area.name}")
+                            if len(si_assignments_for_area) < deployment.si_count:
+                                print(f"WARNING: Could not fulfill all SI requirements for {area.name}. Needed {deployment.si_count}, assigned {len(si_assignments_for_area)}")
+                                # Track unfulfilled SI requirements
+                                unfulfilled = deployment.si_count - len(si_assignments_for_area)
+                                self._add_unfulfilled_requirement(area, 'SI', unfulfilled)
+                    else:
+                        if self.verbose:
+                            print(f"WARNING: No suitable SIs available for {area.name}")
+                        self._add_unfulfilled_requirement(area, 'SI', deployment.si_count)
+            
+            # Create roster assignments for SIs
+            for area, assignment in si_assignments:
+                RosterAssignment.objects.create(
+                    roster=roster,
+                    area=area,
+                    policeman=assignment['officer'],
+                    was_previous_zone=assignment['was_previous_zone'],
+                    was_previous_area=assignment['was_previous_area']
+                )
+            
+            if self.verbose:
+                print(f"\nDEBUG: Completed SI assignments. Total SI assignments: {len(si_assignments)}")
+                print(f"DEBUG: Remaining available SIs: {len(available_sis)}")
+                print(f"DEBUG: SI requirements fulfilled: {rank_assignments['SI']} of {total_requirements['SI']}")
+                
+                # Verify SI assignments
+                assigned_si_count = RosterAssignment.objects.filter(
+                    roster=roster,
+                    policeman__rank='SI'
+                ).count()
+                print(f"DEBUG: Verified SI assignments in database: {assigned_si_count}")
+
+        # SECOND: Create senior officers pool with remaining SIs
         senior_officers = []
-        for rank in ['SI', 'ASI', 'HC']:
+        # Add remaining SIs first
+        if 'SI' in officers_by_rank:
+            senior_officers.extend([si for si in officers_by_rank['SI'] if si.id not in self.assigned_officers])
+        # Then add ASIs and HCs
+        for rank in ['ASI', 'HC']:
             if rank in officers_by_rank:
                 senior_officers.extend(officers_by_rank[rank])
+        
+        if self.verbose:
+            print(f"\nDEBUG: Created senior officers pool with {len(senior_officers)} officers")
+            print(f"DEBUG: Including {len([o for o in senior_officers if o.rank == 'SI'])} remaining SIs")
         
         # Shuffle all officer lists for randomness
         for rank in officers_by_rank:
@@ -206,17 +292,6 @@ class RosterGenerator:
             key=lambda z: zone_senior_requirements[z],
             reverse=True  # Zones with higher requirements get priority
         )
-        
-        # Track assignment counts
-        rank_assignments = {
-            'SI': 0,
-            'ASI': 0,
-            'HC': 0,
-            'CONST': 0,
-            'HG': 0,
-            'DRIVER': 0,
-            'SENIOR': 0
-        }
         
         # Process areas with senior requirements first, balancing across zones
         senior_assignments = []
@@ -256,6 +331,12 @@ class RosterGenerator:
             officer_rank = assignment['officer'].rank
             if officer_rank in rank_assignments:
                 rank_assignments[officer_rank] += 1
+        
+        if self.verbose:
+            print("\n=== ASSIGNMENT SUMMARY ===")
+            print(f"SI Assignments: {len(si_assignments)}")
+            print(f"Senior Assignments: {len(senior_assignments)}")
+            print("=========================\n")
         
         # Now process regular assignments for all areas
         # Sort areas by zones with higher shortage ratio for better distribution
@@ -1239,7 +1320,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.WARNING(f"\nTotal unfulfilled requirements: {', '.join(missing_details)}"))
     
     def _display_reserved_officers(self, generator, verbose=False):
-        """Display reserved (unused) officers"""
+        """Display reserved (unused) officers with detailed information"""
         if not generator.reserved_officers:
             return
         
@@ -1250,18 +1331,33 @@ class Command(BaseCommand):
         for officer in generator.reserved_officers:
             reserved_by_rank[officer.get_rank_display()].append(officer)
         
-        # Count total reserved by rank
+        # Count and display officers by rank with details
         for rank, officers in sorted(reserved_by_rank.items()):
-            self.stdout.write(f"  {rank}: {len(officers)}")
-            if verbose:
-                for officer in officers[:10]:  # Show first 10 for each rank
-                    driver_info = " (Driver)" if officer.is_driver else ""
-                    self.stdout.write(f"    - {officer.name} (Belt No: {officer.belt_no}){driver_info}")
-                if len(officers) > 10:
-                    self.stdout.write(f"    - ... and {len(officers) - 10} more {rank}s")
+            self.stdout.write(f"\n  {rank} ({len(officers)} officers):")
+            
+            # Show details for each officer
+            for officer in officers:
+                gender_info = f"({officer.gender})" if officer.gender else ""
+                driver_info = "(Driver)" if officer.is_driver else ""
+                belt_info = f"Belt#{officer.belt_no}" if officer.belt_no else "No Belt#"
+                
+                # Format the display line with all information
+                details = [d for d in [gender_info, driver_info, belt_info] if d]  # Filter out empty strings
+                details_str = " ".join(details)
+                
+                self.stdout.write(f"    - {officer.name:<30} {details_str}")
         
-        # Show grand total
+        # Show grand total with breakdown
         self.stdout.write(self.style.SUCCESS(f"\nTotal Reserved Officers: {len(generator.reserved_officers)}"))
+        
+        # Show gender breakdown
+        female_count = sum(1 for o in generator.reserved_officers if generator._is_female_officer(o))
+        male_count = len(generator.reserved_officers) - female_count
+        self.stdout.write(f"Gender Distribution: {male_count} Male, {female_count} Female")
+        
+        # Show driver breakdown
+        driver_count = sum(1 for o in generator.reserved_officers if o.is_driver)
+        self.stdout.write(f"Drivers: {driver_count} of {len(generator.reserved_officers)}")
     
     def _display_detailed_assignments(self, roster):
         """Display detailed assignment information"""
