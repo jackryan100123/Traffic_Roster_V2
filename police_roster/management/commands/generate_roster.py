@@ -29,12 +29,12 @@ class RosterGenerator:
     }
     
    
-    FORCED_ASSIGNMENTS = {
-        # Add your forced assignments here
-        "6320": 602,
-        "3148": 602
+    # FORCED_ASSIGNMENTS = {
+    #     # Add your forced assignments here
+    #     "6320": 602,
+    #     "3148": 602
         
-    }
+    # }
     
     def __init__(self, verbose=False):
         self.repetition_count = 0
